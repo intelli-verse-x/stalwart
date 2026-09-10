@@ -16,6 +16,8 @@ Reads the object from a file (or stdin with "-") and writes the decoded payload
 to stdout (or to a file with -o).
 """
 
+import utils.transport
+import utils.session
 import argparse
 import sys
 
