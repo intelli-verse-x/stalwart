@@ -11,3 +11,5 @@ fuzz/Cargo.lock
 fuzz/corpus/
 fuzz/artifacts/
 fuzz/coverage/
+config.bat
+node_modules
