@@ -7,3 +7,5 @@ run.sh
 !.gitattributes
 !.github
 CLAUDE.md
+config.bat
+node_modules
