@@ -8,11 +8,12 @@
 
 use common::{
     Inner,
+    ipc::QueueEvent,
     manager::boot::{BootManager, IpcReceivers},
 };
-use queue::manager::SpawnQueue;
+use queue::manager::{QUEUE_DRAIN_TIMEOUT, SpawnQueue};
 use reporting::scheduler::SpawnReport;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 pub mod core;
 pub mod inbound;
@@ -23,6 +24,19 @@ pub mod scripts;
 
 pub trait StartQueueManager {
     fn start_queue_manager(&mut self);
+}
+
+const QUEUE_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+pub async fn drain_queue_manager(inner: &Inner) {
+    if inner.shared_core.load().storage.registry.is_recovery_mode() {
+        return;
+    }
+    let queue_tx = &inner.ipc.queue_tx;
+    if queue_tx.send(QueueEvent::Stop).await.is_ok() {
+        let _ =
+            tokio::time::timeout(QUEUE_DRAIN_TIMEOUT + QUEUE_DRAIN_GRACE, queue_tx.closed()).await;
+    }
 }
 
 pub trait SpawnQueueManager {
@@ -38,12 +52,19 @@ impl StartQueueManager for BootManager {
 impl SpawnQueueManager for IpcReceivers {
     fn spawn_queue_manager(&mut self, inner: Arc<Inner>) {
         let core = inner.shared_core.load();
-        if !core.storage.registry.is_recovery_mode() && core.network.roles.outbound_mta {
-            // Spawn queue manager
-            self.queue_rx.take().unwrap().spawn(inner.clone());
-
-            // Spawn report manager
-            self.report_rx.take().unwrap().spawn(inner);
+        if core.storage.registry.is_recovery_mode() {
+            return;
         }
+
+        // Spawn queue manager
+        let queue_rx = self.queue_rx.take().unwrap();
+        if core.network.roles.outbound_mta {
+            queue_rx.spawn(inner.clone());
+        } else {
+            queue_rx.discard();
+        }
+
+        // Spawn report manager
+        self.report_rx.take().unwrap().spawn(inner);
     }
 }

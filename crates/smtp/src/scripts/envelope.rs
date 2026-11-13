@@ -12,9 +12,10 @@ use smtp_proto::{
 use utils::DomainPart;
 
 use crate::core::{SessionAddress, SessionData};
+use email::message::delivery::ORCPT_ADDR_TYPE;
 
 impl SessionData {
-    pub fn apply_envelope_modification(&mut self, envelope: Envelope, value: String) {
+    pub fn apply_envelope_modification(&mut self, envelope: Envelope, mut value: String) {
         match envelope {
             Envelope::From => {
                 let (address, address_lcase, domain) = if value.contains('@') {
@@ -111,6 +112,9 @@ impl SessionData {
             }
             Envelope::Orcpt => {
                 if let Some(rcpt_to) = self.rcpt_to.last_mut() {
+                    if value.starts_with(ORCPT_ADDR_TYPE) {
+                        value.drain(..ORCPT_ADDR_TYPE.len());
+                    }
                     rcpt_to.dsn_info = value.into();
                 }
             }

@@ -14,6 +14,7 @@ use common::{
     network::{RcptResolution, SessionStream},
     scripts::ScriptModification,
 };
+use compact_str::CompactString;
 use smtp_proto::{
     RCPT_NOTIFY_DELAY, RCPT_NOTIFY_FAILURE, RCPT_NOTIFY_NEVER, RCPT_NOTIFY_SUCCESS, RcptTo,
 };
@@ -24,7 +25,7 @@ use utils::DomainPart;
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_rcpt_to(&mut self, to: RcptTo<Cow<'_, str>>) -> Result<(), ()> {
-        #[cfg(feature = "test_mode")]
+        #[cfg(stalwart_tests)]
         if self.instance.id.ends_with("-debug") {
             if to.address.contains("fail@") {
                 return self.write(b"503 5.5.1 Invalid recipient.\r\n").await;
@@ -93,13 +94,12 @@ impl<T: SessionStream> Session<T> {
         // Address rewriting and Sieve filtering
         let rcpt_config = &self.server.core.smtp.session.rcpt;
         let rcpt_script = self
-            .server
-            .eval_if::<String, _>(&rcpt_config.script, self, self.data.session_id)
+            .eval_if::<String>(&rcpt_config.script)
             .await
             .and_then(|name| {
                 self.server
                     .get_trusted_sieve_script(&name, self.data.session_id)
-                    .map(|s| (s.clone(), name))
+                    .map(|s| (s, name))
             });
 
         let session_config = &self.server.core.smtp.session;
@@ -117,14 +117,10 @@ impl<T: SessionStream> Session<T> {
             // Sieve filtering
             if let Some((script, script_id)) = rcpt_script {
                 match self
-                    .run_script(
-                        script_id,
-                        script.clone(),
-                        self.build_script_parameters("rcpt"),
-                    )
+                    .run_script(script_id, script, self.build_script_parameters("rcpt"))
                     .await
                 {
-                    ScriptResult::Accept { modifications } if !modifications.is_empty() => {
+                    ScriptResult::Accept { modifications, .. } if !modifications.is_empty() => {
                         for modification in modifications {
                             if let ScriptModification::SetEnvelope { name, value } = modification {
                                 self.data.apply_envelope_modification(name, value);
@@ -152,17 +148,13 @@ impl<T: SessionStream> Session<T> {
             }
 
             // Address rewriting
-            if let Some(new_address) = self
-                .server
-                .eval_if::<String, _>(&rcpt_config.rewrite, self, self.data.session_id)
-                .await
-            {
+            if let Some(new_address) = self.eval_if::<String>(&rcpt_config.rewrite).await {
                 let rcpt = self.data.rcpt_to.last_mut().unwrap();
 
                 trc::event!(
                     Smtp(SmtpEvent::RcptToRewritten),
                     SpanId = self.data.session_id,
-                    Details = rcpt.address_lcase.clone(),
+                    Address = rcpt.address_lcase.clone(),
                     To = new_address.clone(),
                 );
 
@@ -174,8 +166,8 @@ impl<T: SessionStream> Session<T> {
             }
 
             // Check for duplicates
-            let rcpt = self.data.rcpt_to.last().unwrap();
-            if self.data.rcpt_to.iter().filter(|r| r == &rcpt).count() > 1 {
+            let (rcpt, previous) = self.data.rcpt_to.split_last().unwrap();
+            if previous.contains(rcpt) {
                 trc::event!(
                     Smtp(SmtpEvent::RcptToDuplicate),
                     SpanId = self.data.session_id,
@@ -202,8 +194,8 @@ impl<T: SessionStream> Session<T> {
                 let mut new_addr = SessionAddress::new(address);
 
                 if !self.data.rcpt_to.contains(&new_addr) {
-                    new_addr.dsn_info = format!("rfc822;{}", orig_addr.address_lcase).into();
                     new_addr.flags = orig_addr.flags;
+                    new_addr.dsn_info = orig_addr.address_lcase.into();
                     self.data.rcpt_to.push(new_addr);
                 } else {
                     trc::event!(
@@ -227,16 +219,11 @@ impl<T: SessionStream> Session<T> {
 
                 let rcpt_to = self.data.rcpt_to.pop().unwrap().address_lcase;
                 return self
-                    .rcpt_error(b"550 5.1.2 Mailbox does not exist.\r\n", rcpt_to)
+                    .rcpt_error(b"550 5.1.1 Mailbox does not exist.\r\n", rcpt_to)
                     .await;
             }
             Ok(RcptResolution::UnknownDomain) => {
-                if !self
-                    .server
-                    .eval_if(&rcpt_config.relay, self, self.data.session_id)
-                    .await
-                    .unwrap_or(false)
-                {
+                if !self.eval_if(&rcpt_config.relay).await.unwrap_or(false) {
                     trc::event!(
                         Smtp(SmtpEvent::RelayNotAllowed),
                         SpanId = self.data.session_id,
@@ -245,7 +232,7 @@ impl<T: SessionStream> Session<T> {
 
                     let rcpt_to = self.data.rcpt_to.pop().unwrap().address_lcase;
                     return self
-                        .rcpt_error(b"550 5.1.2 Relay not allowed.\r\n", rcpt_to)
+                        .rcpt_error(b"550 5.7.1 Relay not allowed.\r\n", rcpt_to)
                         .await;
                 }
             }
@@ -280,12 +267,20 @@ impl<T: SessionStream> Session<T> {
                     .address_lcase
                     .as_bytes();
                 let to_addr = self.data.rcpt_to.last().unwrap().address_lcase.as_bytes();
-                let mut key = Vec::with_capacity(from_addr.len() + to_addr.len() + 1);
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&(from_addr.len() as u64).to_be_bytes());
+                hasher.update(from_addr);
+                hasher.update(to_addr);
+                let mut key = Vec::with_capacity(blake3::OUT_LEN + 1);
                 key.push(KV_GREYLIST);
-                key.extend_from_slice(from_addr);
-                key.extend_from_slice(to_addr);
+                key.extend_from_slice(hasher.finalize().as_bytes());
 
-                match self.server.in_memory_store().key_exists(key.clone()).await {
+                match self
+                    .server
+                    .in_memory_store()
+                    .key_exists(key.as_slice())
+                    .await
+                {
                     Ok(true) => (),
                     Ok(false) => {
                         match self
@@ -353,7 +348,6 @@ impl<T: SessionStream> Session<T> {
         // Expand list
         if let Some(members) = rcpt_members {
             let list_addr = self.data.rcpt_to.pop().unwrap();
-            let orcpt = format!("rfc822;{}", list_addr.address_lcase);
             for member in members.as_ref() {
                 let member_lcase = member.to_lowercase();
                 let is_local = match self
@@ -367,7 +361,7 @@ impl<T: SessionStream> Session<T> {
                             err.span_id(self.data.session_id)
                                 .caused_by(trc::location!())
                                 .details("Failed to look up mailing list member.")
-                                .ctx(trc::Key::To, member.to_string())
+                                .ctx(trc::Key::To, CompactString::from(member.as_ref()))
                         );
                         false
                     }
@@ -388,7 +382,7 @@ impl<T: SessionStream> Session<T> {
                                 err.span_id(self.data.session_id)
                                     .caused_by(trc::location!())
                                     .details("Failed to resolve mailing list member.")
-                                    .ctx(trc::Key::To, member.to_string())
+                                    .ctx(trc::Key::To, CompactString::from(member.as_ref()))
                             );
                             member.to_string()
                         }
@@ -399,7 +393,7 @@ impl<T: SessionStream> Session<T> {
                 if !self.data.rcpt_to.contains(&member_addr)
                     && member_addr.address_lcase != list_addr.address_lcase
                 {
-                    member_addr.dsn_info = orcpt.clone().into();
+                    member_addr.dsn_info = list_addr.address_lcase.clone().into();
                     member_addr.flags = list_addr.flags;
                     self.data.rcpt_to.push(member_addr);
                 }
