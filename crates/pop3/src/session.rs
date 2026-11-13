@@ -15,6 +15,7 @@ use common::{
     BuildServer,
     network::{SessionData, SessionManager, SessionResult, SessionStream},
 };
+use compact_str::ToCompactString;
 use std::borrow::Cow;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::server::TlsStream;
@@ -33,6 +34,7 @@ impl SessionManager for Pop3SessionManager {
                 state: State::NotAuthenticated {
                     auth_failures: 0,
                     username: None,
+                    sasl_failure: None,
                 },
                 stream: session.stream,
                 in_flight: session.in_flight,
@@ -98,7 +100,7 @@ impl<T: SessionStream> Session<T> {
                             trc::event!(
                                 Network(trc::NetworkEvent::ReadError),
                                 SpanId = self.session_id,
-                                Reason = err.to_string()    ,
+                                Reason = err.to_compact_string()    ,
                                 CausedBy = trc::location!()
                             );
                             break;
@@ -132,7 +134,8 @@ impl<T: SessionStream> Session<T> {
         false
     }
 
-    pub async fn into_tls(self) -> Result<Session<TlsStream<T>>, ()> {
+    pub async fn into_tls(mut self) -> Result<Session<TlsStream<T>>, ()> {
+        self.state.take_sasl_failure();
         Ok(Session {
             stream: self
                 .instance
@@ -140,7 +143,7 @@ impl<T: SessionStream> Session<T> {
                 .await?,
             server: self.server,
             instance: self.instance,
-            receiver: self.receiver,
+            receiver: Parser::default(),
             state: self.state,
             session_id: self.session_id,
             in_flight: self.in_flight,

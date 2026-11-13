@@ -10,6 +10,7 @@ use crate::{
         MessageSource,
         spool::{QueueParams, SmtpSpool},
     },
+    reporting::ReportAddress,
 };
 use common::{Server, expr::if_block::IfBlock, ipc::ReportingEvent};
 
@@ -73,12 +74,17 @@ impl MtaReportSend for Server {
         // Build message
         let mut message = self.new_message(from_addr, MessageSource::Report, parent_session_id);
         for rcpt_ in rcpts {
-            message.add_expanded_recipient(rcpt_.as_ref(), self).await;
+            if let Some(rcpt) = ReportAddress::checked(rcpt_.as_ref(), parent_session_id) {
+                message.add_expanded_recipient(rcpt.as_str(), self).await;
+            }
+        }
+        if message.message.recipients.is_empty() {
+            return;
         }
 
         // Schedule delivery at a random time between now and the next 3 hours
         if !deliver_now {
-            #[cfg(not(feature = "test_mode"))]
+            #[cfg(not(stalwart_tests))]
             {
                 use common::config::smtp::queue::QueueExpiry;
                 use rand::RngExt;
@@ -98,7 +104,7 @@ impl MtaReportSend for Server {
         let dkim_signers = self
             .eval_signers(sign_config, &message.message, parent_session_id)
             .await;
-        message
+        let _ = message
             .queue(
                 QueueParams::new(&report, parent_session_id, self).with_dkim_signers(dkim_signers),
             )
@@ -130,7 +136,7 @@ impl MtaReportSend for Server {
         } else {
             None
         };
-        message
+        let _ = message
             .queue(
                 QueueParams::new(&raw_message, parent_session_id, self)
                     .with_dkim_signers(dkim_signers),

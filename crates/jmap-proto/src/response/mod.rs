@@ -5,6 +5,10 @@
  */
 
 pub mod serialize;
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/jmap-proto/src/response/sonic_tests.rs"]
+mod sonic_tests;
 pub mod status;
 
 use self::serialize::serialize_hex;
@@ -18,6 +22,7 @@ use crate::{
         import::ImportEmailResponse,
         lookup::BlobLookupResponse,
         parse::ParseResponse,
+        passkey::PasskeyRegistrationOptionsResponse,
         query::QueryResponse,
         query_changes::QueryChangesResponse,
         search_snippet::GetSearchSnippetResponse,
@@ -52,8 +57,8 @@ use crate::{
     },
     request::{Call, method::MethodName},
 };
+use ahash::AHashMap;
 use jmap_tools::{Null, Value};
-use std::collections::HashMap;
 
 #[derive(Debug, serde::Serialize)]
 #[serde(untagged)]
@@ -68,6 +73,7 @@ pub enum ResponseMethod<'x> {
     Query(QueryResponse),
     SearchSnippet(GetSearchSnippetResponse),
     ValidateScript(ValidateSieveScriptResponse),
+    PasskeyRegistrationOptions(Box<PasskeyRegistrationOptionsResponse>),
     LookupBlob(BlobLookupResponse),
     UploadBlob(BlobUploadResponse),
     Echo(Value<'x, Null, Null>),
@@ -137,6 +143,7 @@ pub enum ChangesResponseMethod {
     CalendarEvent(Box<ChangesResponse<CalendarEvent>>),
     CalendarEventNotification(Box<ChangesResponse<CalendarEventNotification>>),
     ShareNotification(Box<ChangesResponse<ShareNotification>>),
+    ParticipantIdentity(Box<ChangesResponse<ParticipantIdentity>>),
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -167,12 +174,16 @@ pub struct Response<'x> {
     pub session_state: u32,
 
     #[serde(rename = "createdIds")]
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub created_ids: HashMap<String, AnyId>,
+    #[serde(skip_serializing_if = "crate::method::ahash_is_empty")]
+    pub created_ids: AHashMap<String, AnyId>,
 }
 
 impl<'x> Response<'x> {
-    pub fn new(session_state: u32, created_ids: HashMap<String, AnyId>, capacity: usize) -> Self {
+    pub fn to_json(&self) -> Result<String, sonic_rs::Error> {
+        sonic_rs::to_string(self)
+    }
+
+    pub fn new(session_state: u32, created_ids: AHashMap<String, AnyId>, capacity: usize) -> Self {
         Response {
             session_state,
             created_ids,
@@ -464,6 +475,12 @@ impl<'x> From<GetSearchSnippetResponse> for ResponseMethod<'x> {
 impl<'x> From<ValidateSieveScriptResponse> for ResponseMethod<'x> {
     fn from(value: ValidateSieveScriptResponse) -> Self {
         ResponseMethod::ValidateScript(value)
+    }
+}
+
+impl<'x> From<PasskeyRegistrationOptionsResponse> for ResponseMethod<'x> {
+    fn from(value: PasskeyRegistrationOptionsResponse) -> Self {
+        ResponseMethod::PasskeyRegistrationOptions(Box::new(value))
     }
 }
 

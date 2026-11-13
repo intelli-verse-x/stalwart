@@ -12,10 +12,11 @@ use crate::network::acme::{
     ParsedCert, PemCert,
 };
 use crate::{KV_ACME, Server};
-use chrono::{TimeZone, Utc};
+use compact_str::{CompactString, ToCompactString, format_compact};
 use dns_update::DnsRecord;
 use futures::future::try_join_all;
 use rcgen::{CertificateParams, DistinguishedName, KeyPair, PKCS_ECDSA_P256_SHA256};
+use registry::types::datetime::UTCDateTime;
 use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
@@ -25,6 +26,8 @@ use x509_parser::parse_x509_certificate;
 use x509_parser::prelude::{GeneralName, ParsedExtension};
 
 const HOSTNAMES: &[&str] = &["mta-sts", "ua-auto-config", "autoconfig", "autodiscover"];
+const ORDER_PROCESSING_ATTEMPTS: u64 = 10;
+const AUTH_ATTEMPTS: u64 = 5;
 
 impl AcmeRequestBuilder {
     pub fn build_domains(
@@ -78,13 +81,7 @@ impl AcmeRequestBuilder {
         } else {
             hostnames
                 .iter()
-                .map(|h| {
-                    if h.contains('.') {
-                        h.clone()
-                    } else {
-                        format!("{h}.{domain}")
-                    }
-                })
+                .map(|h| qualify_hostname(h, domain))
                 .collect()
         }
     }
@@ -92,11 +89,42 @@ impl AcmeRequestBuilder {
     pub async fn renew(
         &self,
         server: &Server,
-        domains: Vec<String>,
+        domains: &[String],
         reuse_key_pem: Option<String>,
         dns_parameters: Option<AcmeDnsParameters>,
     ) -> AcmeResult<PemCert> {
-        let mut params = CertificateParams::new(domains.clone()).map_err(|err| {
+        let mut published = BTreeSet::new();
+        let result = self
+            .run_order(
+                server,
+                domains,
+                reuse_key_pem,
+                dns_parameters.as_ref(),
+                &mut published,
+            )
+            .await;
+
+        if let Some(dns_parameters) = &dns_parameters {
+            for (zone, challenge_name) in published {
+                let _ = dns_parameters
+                    .updater
+                    .delete_rrset(&zone, &challenge_name, dns_update::DnsRecordType::TXT)
+                    .await;
+            }
+        }
+
+        result
+    }
+
+    async fn run_order(
+        &self,
+        server: &Server,
+        domains: &[String],
+        reuse_key_pem: Option<String>,
+        dns_parameters: Option<&AcmeDnsParameters>,
+        published: &mut BTreeSet<(String, String)>,
+    ) -> AcmeResult<PemCert> {
+        let mut params = CertificateParams::new(domains.to_vec()).map_err(|err| {
             AcmeError::Crypto(format!("Failed to create certificate params: {}", err))
         })?;
         params.distinguished_name = DistinguishedName::new();
@@ -108,16 +136,16 @@ impl AcmeRequestBuilder {
                 AcmeError::Crypto(format!("Failed to generate key pair: {}", err))
             })?,
         };
-        let response = self.new_order(domains.clone()).await?;
+        let response = self.new_order(domains.to_vec()).await?;
         let order_url = response.location;
         let mut order = response.body;
         let mut retry_after = None;
 
         trc::event!(
             Acme(AcmeEvent::OrderStart),
-            Url = self.directory.new_order.to_string(),
-            Details = order_url.to_string(),
-            Hostname = domains.as_slice(),
+            Url = CompactString::from(&self.directory.new_order),
+            Details = CompactString::from(&order_url),
+            Hostname = domains,
             Type = self.challenge.as_str(),
         );
 
@@ -126,31 +154,33 @@ impl AcmeRequestBuilder {
                 OrderStatus::Pending => {
                     if matches!(self.challenge, ChallengeType::Dns01) {
                         for url in &order.authorizations {
-                            self.authorize(server, url, dns_parameters.as_ref()).await?;
+                            self.authorize(server, url, dns_parameters, Some(published))
+                                .await?;
                         }
                     } else {
                         let auth_futures = order
                             .authorizations
                             .iter()
-                            .map(|url| self.authorize(server, url, dns_parameters.as_ref()));
+                            .map(|url| self.authorize(server, url, dns_parameters, None));
                         try_join_all(auth_futures).await?;
                     }
                     trc::event!(
                         Acme(AcmeEvent::AuthCompleted),
-                        Url = self.directory.new_order.to_string(),
-                        Hostname = domains.as_slice(),
+                        Url = CompactString::from(&self.directory.new_order),
+                        Hostname = domains,
                     );
                     let response = self.order(&order_url).await?;
                     order = response.body;
                     retry_after = response.retry_after;
                 }
                 OrderStatus::Processing => {
-                    for i in 0u64..10 {
+                    for i in 0u64..ORDER_PROCESSING_ATTEMPTS {
                         trc::event!(
                             Acme(AcmeEvent::OrderProcessing),
-                            Url = self.directory.new_order.to_string(),
-                            Hostname = domains.as_slice(),
-                            Total = i,
+                            Url = CompactString::from(&self.directory.new_order),
+                            Hostname = domains,
+                            Attempt = i + 1,
+                            Limit = ORDER_PROCESSING_ATTEMPTS,
                         );
 
                         tokio::time::sleep(
@@ -160,7 +190,7 @@ impl AcmeRequestBuilder {
                         let response = self
                             .order(&order_url)
                             .await?
-                            .assert_reasonable_retry_after(self.max_retries)?;
+                            .assert_reasonable_retry_after()?;
                         order = response.body;
                         retry_after = response.retry_after;
                         if order.status != OrderStatus::Processing {
@@ -168,16 +198,14 @@ impl AcmeRequestBuilder {
                         }
                     }
                     if order.status == OrderStatus::Processing {
-                        return Err(AcmeError::OrderTimeout {
-                            max_retries: self.max_retries,
-                        });
+                        return Err(AcmeError::OrderTimeout);
                     }
                 }
                 OrderStatus::Ready => {
                     trc::event!(
                         Acme(AcmeEvent::OrderReady),
-                        Url = self.directory.new_order.to_string(),
-                        Hostname = domains.as_slice(),
+                        Url = CompactString::from(&self.directory.new_order),
+                        Hostname = domains,
                     );
 
                     let csr = params.serialize_request(&key_pair).map_err(|err| {
@@ -189,11 +217,11 @@ impl AcmeRequestBuilder {
                 OrderStatus::Valid { certificate } => {
                     trc::event!(
                         Acme(AcmeEvent::OrderValid),
-                        Url = self.directory.new_order.to_string(),
-                        Hostname = domains.as_slice(),
+                        Url = CompactString::from(&self.directory.new_order),
+                        Hostname = domains,
                     );
 
-                    let certificate = self.select_certificate(&domains, certificate).await?;
+                    let certificate = self.select_certificate(domains, certificate).await?;
 
                     return Ok(PemCert {
                         certificate,
@@ -209,9 +237,9 @@ impl AcmeRequestBuilder {
 
                     trc::event!(
                         Acme(AcmeEvent::OrderInvalid),
-                        Url = self.directory.new_order.to_string(),
-                        Details = order_url.to_string(),
-                        Hostname = domains.as_slice(),
+                        Url = CompactString::from(&self.directory.new_order),
+                        Details = order_url,
+                        Hostname = domains,
                         Reason = reason.clone(),
                     );
 
@@ -226,11 +254,9 @@ impl AcmeRequestBuilder {
         server: &Server,
         url: &String,
         dns_parameters: Option<&AcmeDnsParameters>,
+        published: Option<&mut BTreeSet<(String, String)>>,
     ) -> AcmeResult<()> {
-        let response = self
-            .auth(url)
-            .await?
-            .assert_reasonable_retry_after(self.max_retries)?;
+        let response = self.auth(url).await?.assert_reasonable_retry_after()?;
         let mut retry_after = response.retry_after;
         let auth = response.body;
 
@@ -240,9 +266,9 @@ impl AcmeRequestBuilder {
 
                 trc::event!(
                     Acme(AcmeEvent::AuthStart),
-                    Hostname = domain.to_string(),
+                    Hostname = CompactString::from(&domain),
                     Type = self.challenge.as_str(),
-                    Url = self.directory.new_order.to_string(),
+                    Url = CompactString::from(&self.directory.new_order),
                 );
 
                 let challenge = auth
@@ -287,14 +313,15 @@ impl AcmeRequestBuilder {
                             .await?;
                     }
                     ChallengeType::Dns01 => {
-                        let dns_parameters = dns_parameters.unwrap();
+                        let Some(dns_parameters) = dns_parameters else {
+                            return Err(AcmeError::Invalid(
+                                "DNS-01 challenge requested but a DNS provider was not configured"
+                                    .to_string(),
+                            ));
+                        };
                         let domain = domain.strip_prefix("*.").unwrap_or(&domain);
 
-                        let zone = dns_parameters
-                            .origin
-                            .as_deref()
-                            .or_else(|| psl::domain_str(domain))
-                            .unwrap_or(domain);
+                        let zone = challenge_zone(&dns_parameters.zone, domain);
 
                         let proof = self.dns_proof(challenge)?;
                         let challenge_name = format!("_acme-challenge.{}", domain);
@@ -307,13 +334,22 @@ impl AcmeRequestBuilder {
                                 vec![DnsRecord::TXT(proof.clone())],
                             )
                             .await
-                            .map_err(AcmeError::Dns)?;
+                            .map_err(|err| {
+                                AcmeError::Dns(format!("Failed to set DNS RRSet: {err}"))
+                            })?;
+
+                        if let Some(published) = published {
+                            published.insert((zone.to_string(), challenge_name.clone()));
+                        }
+
                         dns_parameters
                             .updater
                             .wait_for_txt_propagation(&challenge_name, zone, &proof)
                             .await;
                     }
-                    ChallengeType::DnsPersist01 => {}
+                    ChallengeType::DnsPersist01 => {
+                        self.directory.meta.verify_persist_challenge(challenge)?;
+                    }
                     ChallengeType::Unknown => unreachable!(),
                 }
 
@@ -324,10 +360,10 @@ impl AcmeRequestBuilder {
             _ => {
                 trc::event!(
                     Acme(AcmeEvent::AuthError),
-                    Hostname = auth.identifier.hostname().to_string(),
+                    Hostname = CompactString::from(auth.identifier.hostname()),
                     Type = self.challenge.as_str(),
-                    Url = self.directory.new_order.to_string(),
-                    Details = url.to_string(),
+                    Url = CompactString::from(&self.directory.new_order),
+                    Details = CompactString::from(url),
                     Reason = auth.to_error(),
                 );
 
@@ -335,21 +371,19 @@ impl AcmeRequestBuilder {
             }
         };
 
-        for i in 0u64..5 {
+        for i in 0u64..AUTH_ATTEMPTS {
             tokio::time::sleep(retry_after.unwrap_or_else(|| Duration::from_secs(1u64 << i))).await;
-            let response = self
-                .auth(url)
-                .await?
-                .assert_reasonable_retry_after(self.max_retries)?;
+            let response = self.auth(url).await?.assert_reasonable_retry_after()?;
             retry_after = response.retry_after;
 
             match response.body.status {
                 AuthStatus::Pending => {
                     trc::event!(
                         Acme(AcmeEvent::AuthPending),
-                        Hostname = domain.to_string(),
-                        Url = self.directory.new_order.to_string(),
-                        Total = i,
+                        Hostname = CompactString::from(&domain),
+                        Url = CompactString::from(&self.directory.new_order),
+                        Attempt = i + 1,
+                        Limit = AUTH_ATTEMPTS,
                     );
 
                     self.challenge(&challenge_url).await?
@@ -357,8 +391,8 @@ impl AcmeRequestBuilder {
                 AuthStatus::Valid => {
                     trc::event!(
                         Acme(AcmeEvent::AuthValid),
-                        Hostname = domain.to_string(),
-                        Url = self.directory.new_order.to_string(),
+                        Hostname = domain,
+                        Url = CompactString::from(&self.directory.new_order),
                     );
 
                     return Ok(());
@@ -366,10 +400,10 @@ impl AcmeRequestBuilder {
                 _ => {
                     trc::event!(
                         Acme(AcmeEvent::AuthError),
-                        Hostname = domain.to_string(),
+                        Hostname = CompactString::from(domain),
                         Type = self.challenge.as_str(),
-                        Url = self.directory.new_order.to_string(),
-                        Details = url.to_string(),
+                        Url = CompactString::from(&self.directory.new_order),
+                        Details = CompactString::from(url),
                         Reason = response.body.to_error(),
                     );
 
@@ -380,16 +414,15 @@ impl AcmeRequestBuilder {
 
         trc::event!(
             Acme(AcmeEvent::AuthTooManyAttempts),
-            Hostname = domain.to_string(),
+            Hostname = CompactString::from(&domain),
             Type = self.challenge.as_str(),
-            Url = self.directory.new_order.to_string(),
-            Details = url.to_string(),
-            Total = 5u64,
+            Url = CompactString::from(&self.directory.new_order),
+            Details = CompactString::from(url),
+            Attempt = AUTH_ATTEMPTS,
+            Limit = AUTH_ATTEMPTS,
         );
 
-        Err(AcmeError::AuthTimeout {
-            max_retries: self.max_retries,
-        })
+        Err(AcmeError::AuthTimeout)
     }
 
     async fn select_certificate(&self, domains: &[String], url: String) -> AcmeResult<String> {
@@ -411,9 +444,9 @@ impl AcmeRequestBuilder {
                 Err(err) => {
                     trc::event!(
                         Acme(AcmeEvent::ProcessCert),
-                        Url = alternate.to_string(),
+                        Url = CompactString::from(alternate),
                         Hostname = domains,
-                        Reason = err.to_string(),
+                        Reason = err.to_compact_string(),
                     );
                 }
             }
@@ -422,13 +455,35 @@ impl AcmeRequestBuilder {
         trc::event!(
             Acme(AcmeEvent::ProcessCert),
             Hostname = domains,
-            Reason = format!(
+            Reason = format_compact!(
                 "Preferred certificate chain '{preferred}' not offered by the CA; using the default chain",
             ),
         );
 
         Ok(response.body)
     }
+}
+
+pub fn qualify_hostname(hostname: &str, domain: &str) -> String {
+    if hostname.contains('.') {
+        hostname.to_string()
+    } else {
+        format!("{hostname}.{domain}")
+    }
+}
+
+pub fn is_within_domain(hostname: &str, domain: &str, aliases: &[String]) -> bool {
+    is_within_zone(hostname, domain) || aliases.iter().any(|alias| is_within_zone(hostname, alias))
+}
+
+fn is_within_zone(hostname: &str, zone: &str) -> bool {
+    hostname
+        .len()
+        .checked_sub(zone.len())
+        .and_then(|split| hostname.split_at_checked(split))
+        .is_some_and(|(prefix, suffix)| {
+            suffix.eq_ignore_ascii_case(zone) && (prefix.is_empty() || prefix.ends_with('.'))
+        })
 }
 
 fn chain_matches(pem_chain: &str, preferred: &str) -> bool {
@@ -460,7 +515,7 @@ impl ParsedCert {
     pub fn parse_der(der: &[u8]) -> AcmeResult<ParsedCert> {
         parse_x509_certificate(der)
             .map_err(|err| AcmeError::Crypto(format!("Failed to parse X.509 certificate: {}", err)))
-            .and_then(|(_, cert)| {
+            .map(|(_, cert)| {
                 // Add CNs and SANs to the list of names
                 let mut names: BTreeSet<String> = BTreeSet::new();
                 for name in cert.subject().iter_common_name() {
@@ -489,79 +544,44 @@ impl ParsedCert {
                     }
                 }
 
-                Ok(ParsedCert {
+                ParsedCert {
                     sans: names.into_iter().collect(),
                     issuer: cert.tbs_certificate.issuer().to_string(),
-                    valid_not_before: Utc
-                        .timestamp_opt(cert.tbs_certificate.validity().not_before.timestamp(), 0)
-                        .single()
-                        .ok_or_else(|| {
-                            AcmeError::Crypto(
-                                "Certificate not_before time is out of range".to_string(),
-                            )
-                        })?,
-                    valid_not_after: Utc
-                        .timestamp_opt(cert.tbs_certificate.validity().not_after.timestamp(), 0)
-                        .single()
-                        .ok_or_else(|| {
-                            AcmeError::Crypto(
-                                "Certificate not_after time is out of range".to_string(),
-                            )
-                        })?,
-                })
+                    valid_not_before: UTCDateTime::from_timestamp(
+                        cert.tbs_certificate.validity().not_before.timestamp(),
+                    ),
+                    valid_not_after: UTCDateTime::from_timestamp(
+                        cert.tbs_certificate.validity().not_after.timestamp(),
+                    ),
+                }
             })
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::chain_matches;
-    use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, PKCS_ECDSA_P256_SHA256};
-
-    fn self_signed_pem(common_name: &str) -> String {
-        let mut params = CertificateParams::new(vec!["host.example".to_string()]).unwrap();
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, common_name);
-        params.distinguished_name = dn;
-        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-        params.self_signed(&key_pair).unwrap().pem()
-    }
-
-    #[test]
-    fn matches_top_certificate_issuer() {
-        let chain = self_signed_pem("ISRG Root X1");
-        assert!(chain_matches(&chain, "ISRG Root X1"));
-    }
-
-    #[test]
-    fn match_is_case_sensitive() {
-        let chain = self_signed_pem("ISRG Root X1");
-        assert!(!chain_matches(&chain, "isrg root x1"));
-    }
-
-    #[test]
-    fn match_is_exact_not_substring() {
-        let chain = self_signed_pem("ISRG Root X10");
-        assert!(!chain_matches(&chain, "ISRG Root X1"));
-    }
-
-    #[test]
-    fn does_not_match_unrelated_issuer() {
-        let chain = self_signed_pem("ISRG Root X2");
-        assert!(!chain_matches(&chain, "ISRG Root X1"));
-    }
-
-    #[test]
-    fn uses_topmost_certificate_not_leaf() {
-        let leaf = self_signed_pem("Leaf Issuer");
-        let top = self_signed_pem("ISRG Root X1");
-        let chain = format!("{leaf}{top}");
-        assert!(chain_matches(&chain, "ISRG Root X1"));
-        assert!(!chain_matches(&chain, "Leaf Issuer"));
-    }
-
-    #[test]
-    fn rejects_unparseable_chain() {
-        assert!(!chain_matches("not a pem", "ISRG Root X1"));
+    pub fn unrequested_name(&self, requested: &[String]) -> Option<&str> {
+        self.sans.iter().map(String::as_str).find(|name| {
+            !requested
+                .iter()
+                .any(|requested| requested.eq_ignore_ascii_case(name))
+        })
     }
 }
+
+fn challenge_zone<'x>(zone: &'x str, domain: &'x str) -> &'x str {
+    let in_zone = domain
+        .len()
+        .checked_sub(zone.len())
+        .and_then(|split| domain.split_at_checked(split))
+        .is_some_and(|(prefix, suffix)| {
+            suffix.eq_ignore_ascii_case(zone) && (prefix.is_empty() || prefix.ends_with('.'))
+        });
+    if in_zone {
+        zone
+    } else {
+        psl::domain_str(domain).unwrap_or(domain)
+    }
+}
+
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../../stalwart-tests/unit/common/src/network/acme/order/tests.rs"]
+mod tests;
