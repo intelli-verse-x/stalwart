@@ -8,17 +8,15 @@ use crate::{
     SearchStore,
     backend::meili::{MeiliSearchStore, Task, TaskStatus, TaskUid},
     search::{
-        CalendarSearchField, ContactSearchField, EmailSearchField, SearchField, SearchableField,
-        TracingSearchField,
+        CalendarSearchField, ContactSearchField, EmailSearchField, FileSearchField, SearchField,
+        SearchableField, TracingSearchField,
     },
-    write::now,
 };
 use registry::schema::structs;
 use reqwest::{Error, Response, Url};
 use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 
-const UNCONFIRMED_TASK_RECHECK_DELAY: u64 = 600;
 pub(crate) const MAX_TOTAL_HITS: u64 = 100_000;
 
 impl MeiliSearchStore {
@@ -51,7 +49,7 @@ impl MeiliSearchStore {
             client: ms.client,
             url: ms.url,
             task_poll_interval: config.poll_interval.into_inner(),
-            task_poll_retries: config.max_retries as usize,
+            task_poll_retries: config.max_polls as usize,
             task_fail_on_timeout: config.fail_on_timeout,
         })))
     }
@@ -60,6 +58,7 @@ impl MeiliSearchStore {
         self.create_index::<EmailSearchField>().await?;
         self.create_index::<CalendarSearchField>().await?;
         self.create_index::<ContactSearchField>().await?;
+        self.create_index::<FileSearchField>().await?;
         self.create_index::<TracingSearchField>().await?;
         Ok(())
     }
@@ -88,6 +87,9 @@ impl MeiliSearchStore {
         let index_name = T::index().index_name();
 
         if self.index_exists(index_name).await? {
+            if self.index_max_total_hits(index_name).await? != Some(MAX_TOTAL_HITS) {
+                self.update_index_pagination(index_name).await?;
+            }
             return Ok(());
         }
 
@@ -133,7 +135,7 @@ impl MeiliSearchStore {
             }
         }
 
-        #[cfg(feature = "test_mode")]
+        #[cfg(stalwart_tests)]
         filterable.push(Value::String("bcc".into()));
 
         if !searchable.is_empty() {
@@ -162,6 +164,27 @@ impl MeiliSearchStore {
         self.update_index_pagination(index_name).await?;
 
         Ok(())
+    }
+
+    async fn index_max_total_hits(&self, index_uid: &str) -> trc::Result<Option<u64>> {
+        let response = assert_success(
+            self.client
+                .get(format!(
+                    "{}/indexes/{}/settings/pagination",
+                    self.url, index_uid
+                ))
+                .send()
+                .await,
+        )
+        .await?;
+        let body = response
+            .text()
+            .await
+            .map_err(|err| trc::StoreEvent::MeilisearchError.reason(err))?;
+
+        serde_json::from_str::<Value>(&body)
+            .map(|value| value.get("maxTotalHits").and_then(Value::as_u64))
+            .map_err(|err| trc::StoreEvent::MeilisearchError.reason(err))
     }
 
     async fn update_index_pagination(&self, index_uid: &str) -> trc::Result<bool> {
@@ -198,44 +221,6 @@ impl MeiliSearchStore {
         )
         .await?;
         self.wait_for_task(response).await
-    }
-
-    #[cfg(feature = "test_mode")]
-    pub async fn drop_indexes(&self) -> trc::Result<()> {
-        use crate::write::SearchIndex;
-
-        for index in &[
-            SearchIndex::Email,
-            SearchIndex::Calendar,
-            SearchIndex::Contacts,
-            SearchIndex::Tracing,
-        ] {
-            let response = self
-                .client
-                .delete(format!("{}/indexes/{}", self.url, index.index_name()))
-                .send()
-                .await
-                .map_err(|err| trc::StoreEvent::MeilisearchError.reason(err))?;
-
-            match response.status().as_u16() {
-                200..=299 => {
-                    self.wait_for_task(response).await?;
-                }
-                400..=499 => {
-                    // Index does not exist
-                    return Ok(());
-                }
-                _ => {
-                    let status = response.status();
-                    let msg = response.text().await.unwrap_or_default();
-                    return Err(trc::StoreEvent::MeilisearchError
-                        .reason(msg)
-                        .ctx(trc::Key::Code, status.as_u16()));
-                }
-            }
-        }
-
-        Ok(())
     }
 
     pub(crate) async fn wait_for_task(&self, response: Response) -> trc::Result<bool> {
@@ -300,18 +285,13 @@ impl MeiliSearchStore {
             }
         }
 
-        let err = trc::StoreEvent::MeilisearchError
-            .reason("Timed out waiting for Meilisearch task")
-            .id(task_uid);
-
-        Err(if self.task_fail_on_timeout {
-            err
+        if self.task_fail_on_timeout {
+            Err(trc::StoreEvent::MeilisearchError
+                .reason("Timed out waiting for Meilisearch task")
+                .id(task_uid))
         } else {
-            err.ctx(
-                trc::Key::NextRetry,
-                now().saturating_add(UNCONFIRMED_TASK_RECHECK_DELAY),
-            )
-        })
+            Ok(true)
+        }
     }
 }
 
@@ -330,3 +310,8 @@ pub(crate) async fn assert_success(response: Result<Response, Error>) -> trc::Re
         Err(err) => Err(trc::StoreEvent::MeilisearchError.reason(err)),
     }
 }
+
+#[cfg(stalwart_tests)]
+#[rustfmt::skip]
+#[path = "../../../../../../stalwart-tests/unit/store/src/backend/meili/main/test_support.rs"]
+mod test_support;

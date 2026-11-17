@@ -21,6 +21,7 @@ use crate::{
         import::ImportEmailRequest,
         lookup::BlobLookupRequest,
         parse::ParseRequest,
+        passkey::PasskeyRegistrationOptionsRequest,
         query::QueryRequest,
         query_changes::QueryChangesRequest,
         search_snippet::GetSearchSnippetRequest,
@@ -39,8 +40,9 @@ use crate::{
     },
     request::{capability::CapabilityIds, reference::MaybeIdReference},
 };
+use ahash::AHashMap;
 use jmap_tools::{Null, Value};
-use std::{collections::HashMap, fmt::Debug, str::FromStr};
+use std::{fmt::Debug, str::FromStr};
 use types::id::Id;
 use utils::map::vec_map::VecMap;
 
@@ -60,7 +62,7 @@ where
 pub struct Request<'x> {
     pub using: CapabilityIds,
     pub method_calls: Vec<Call<RequestMethod<'x>>>,
-    pub created_ids: Option<HashMap<String, AnyId>>,
+    pub created_ids: Option<AHashMap<String, AnyId>>,
 }
 
 #[derive(Debug)]
@@ -82,6 +84,7 @@ pub enum RequestMethod<'x> {
     QueryChanges(QueryChangesRequestMethod),
     SearchSnippet(Box<GetSearchSnippetRequest>),
     ValidateScript(Box<ValidateSieveScriptRequest>),
+    PasskeyRegistrationOptions(Box<PasskeyRegistrationOptionsRequest>),
     LookupBlob(Box<BlobLookupRequest>),
     UploadBlob(Box<BlobUploadRequest>),
     Echo(Value<'x, Null, Null>),

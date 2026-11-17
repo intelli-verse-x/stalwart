@@ -5,23 +5,38 @@
  */
 
 use deadpool::managed::Pool;
-use ldap3::{LdapConnSettings, ldap_escape};
+use failover::LdapServers;
+use ldap3::{Ldap, LdapConnSettings, ldap_escape};
+use std::{sync::Arc, time::Duration};
 
 pub mod config;
+pub mod failover;
 pub mod lookup;
 pub mod pool;
 
 pub struct LdapDirectory {
     pool: Pool<LdapConnectionManager>,
     mappings: LdapMappings,
-    auth_bind: bool,
+    bind_pool: Option<Pool<LdapConnectionManager>>,
+    servers: Arc<LdapServers>,
+    timeout: Duration,
+}
+
+impl LdapDirectory {
+    pub fn has_failover(&self) -> bool {
+        self.servers.has_failover()
+    }
+
+    pub fn disable_failover(&self) {
+        self.servers.disable_failover();
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct LdapMappings {
     base_dn: String,
     filter_login: LdapFilter,
-    filter_mailbox: LdapFilter,
+    filter_recipient: LdapFilter,
     filter_member_of: Option<LdapFilter>,
     attr_class: Vec<String>,
     attr_groups: Vec<String>,
@@ -57,15 +72,18 @@ impl LdapFilter {
                 LdapFilterItem::Full => result.push_str(ldap_escape(value).as_ref()),
                 LdapFilterItem::LocalPart => {
                     result.push_str(
-                        value
-                            .rsplit_once('@')
-                            .map(|(local, _)| local)
-                            .unwrap_or(value),
+                        ldap_escape(
+                            value
+                                .rsplit_once('@')
+                                .map(|(local, _)| local)
+                                .unwrap_or(value),
+                        )
+                        .as_ref(),
                     );
                 }
                 LdapFilterItem::DomainPart => {
                     if let Some((_, domain)) = value.rsplit_once('@') {
-                        result.push_str(domain);
+                        result.push_str(ldap_escape(domain).as_ref());
                     }
                 }
             }
@@ -76,9 +94,19 @@ impl LdapFilter {
 }
 
 pub(crate) struct LdapConnectionManager {
-    address: String,
+    servers: Arc<LdapServers>,
+    connector: Arc<LdapConnector>,
+}
+
+pub(crate) struct LdapConnector {
     settings: LdapConnSettings,
     bind_dn: Option<Bind>,
+    timeout: Duration,
+}
+
+pub(crate) struct LdapConnection {
+    ldap: Ldap,
+    server: usize,
 }
 
 pub(crate) struct Bind {
@@ -87,11 +115,19 @@ pub(crate) struct Bind {
 }
 
 impl LdapConnectionManager {
-    pub fn new(address: String, settings: LdapConnSettings, bind_dn: Option<Bind>) -> Self {
+    pub fn new(
+        servers: Arc<LdapServers>,
+        settings: LdapConnSettings,
+        bind_dn: Option<Bind>,
+        timeout: Duration,
+    ) -> Self {
         Self {
-            address,
-            settings,
-            bind_dn,
+            servers,
+            connector: Arc::new(LdapConnector {
+                settings,
+                bind_dn,
+                timeout,
+            }),
         }
     }
 }
@@ -101,3 +137,8 @@ impl Bind {
         Self { dn, password }
     }
 }
+
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../../stalwart-tests/unit/directory/src/backend/ldap/tests.rs"]
+mod tests;
